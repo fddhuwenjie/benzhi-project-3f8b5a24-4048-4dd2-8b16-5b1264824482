@@ -321,12 +321,20 @@ func (s *Store) SaveValidation(rid, payloadHash string, result any) error {
 	if err != nil {
 		return err
 	}
-	s.validations[rid] = CachedValidation{PayloadHash: payloadHash, Result: b}
-	all, err := json.Marshal(s.validations)
+	updated := make(map[string]CachedValidation, len(s.validations)+1)
+	for k, v := range s.validations {
+		updated[k] = v
+	}
+	updated[rid] = CachedValidation{PayloadHash: payloadHash, Result: b}
+	all, err := json.Marshal(updated)
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(filepath.Join(filepath.Dir(s.path), "validations.json"), all, 0644)
+	if err := os.WriteFile(filepath.Join(filepath.Dir(s.path), "validations.json"), all, 0644); err != nil {
+		return err
+	}
+	s.validations = updated
+	return nil
 }
 
 func (s *Store) Validation(rid string, result any) (string, bool, error) {
