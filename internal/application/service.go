@@ -64,7 +64,7 @@ func (s *Service) Create(c *domain.Case, rid string) (*domain.Case, error) {
 	if err := s.st.Create(c, rid); err != nil {
 		return nil, err
 	}
-	return c, nil
+	return domain.CloneCase(c), nil
 }
 func (s *Service) mutate(id, rid string, rev int, payload any, fn func(*domain.Case) error) (*domain.Case, error) {
 	s.mu.Lock()
@@ -112,7 +112,7 @@ func (s *Service) mutate(id, rid string, rev int, payload any, fn func(*domain.C
 	if err := s.st.PutEvents(c, newEvents, rid, c, hash); err != nil {
 		return nil, err
 	}
-	return c, nil
+	return domain.CloneCase(c), nil
 }
 func (s *Service) SubmitPlan(id, rid string, rev int, p domain.Plan) (*domain.Case, error) {
 	return s.mutate(id, rid, rev, p, func(c *domain.Case) error {

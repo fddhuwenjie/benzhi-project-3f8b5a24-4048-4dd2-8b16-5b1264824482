@@ -69,6 +69,10 @@ func Open(dir string) (*Store, error) {
 			}
 		}
 	}
+	cachedRids := make(map[string]bool, len(s.requests))
+	for rid := range s.requests {
+		cachedRids[rid] = true
+	}
 	if b, e := os.ReadFile(filepath.Join(dir, "cases.json")); e == nil {
 		json.Unmarshal(b, &s.cases)
 	}
@@ -80,6 +84,7 @@ func Open(dir string) (*Store, error) {
 	sc := bufio.NewScanner(f)
 	last := map[string]string{}
 	revs := map[string]int{}
+	rebuilt := false
 	for sc.Scan() {
 		var rec Record
 		if json.Unmarshal(sc.Bytes(), &rec) != nil {
@@ -98,8 +103,13 @@ func Open(dir string) (*Store, error) {
 		last[rec.CaseID] = rec.Event.Hash
 		s.events[rec.CaseID] = append(s.events[rec.CaseID], rec.Event)
 		if rec.Event.RequestID != "" {
-			if _, restored := s.requests[rec.Event.RequestID]; !restored {
-				s.requests[rec.Event.RequestID] = s.cases[rec.CaseID]
+			if !cachedRids[rec.Event.RequestID] {
+				if snap := domain.ReplayCaseFromEvents(s.events[rec.CaseID]); snap != nil {
+					cloned := domain.CloneCase(snap)
+					s.requests[rec.Event.RequestID] = cloned
+					s.requestResults[rec.Event.RequestID] = CachedRequestResult{Kind: "case", Result: mustMarshal(cloned)}
+					rebuilt = true
+				}
 			}
 			if _, ok := s.requestHashes[rec.Event.RequestID]; !ok {
 				if b, e := json.Marshal(rec.Event.Data); e == nil {
@@ -108,7 +118,20 @@ func Open(dir string) (*Store, error) {
 			}
 		}
 	}
+	if err := sc.Err(); err != nil {
+		return nil, err
+	}
+	if rebuilt {
+		if b, e := json.Marshal(s.requestResults); e == nil {
+			_ = os.WriteFile(filepath.Join(dir, "request_results.json"), b, 0644)
+		}
+	}
 	return s, nil
+}
+
+func mustMarshal(v any) json.RawMessage {
+	b, _ := json.Marshal(v)
+	return b
 }
 
 func (s *Store) RequestHash(rid string) (string, bool) {
@@ -217,7 +240,7 @@ func (s *Store) Create(c *domain.Case, rid string) error {
 	s.events[c.ID] = append(s.events[c.ID], ev)
 	sb, _ := json.Marshal(s.cases)
 	os.WriteFile(filepath.Join(filepath.Dir(s.path), "cases.json"), sb, 0644)
-	s.requests[rid] = c
+	s.requests[rid] = domain.CloneCase(c)
 	if b, e := json.Marshal(ev.Data); e == nil {
 		s.requestHashes[rid] = string(b)
 		if hb, e2 := json.Marshal(s.requestHashes); e2 == nil {
