@@ -150,6 +150,69 @@ func (s *Store) PutCase(c *domain.Case, ev domain.Event, rid string, result any)
 	return s.PutEvents(c, []domain.Event{ev}, rid, result, "")
 }
 
+// appendEventsLocked 将事件追加到事件日志并进行同步，同时返回
+// 追加前的文件偏移量。调用者可以使用此偏移量通过 rollbackEventsLocked
+// 撤销追加操作。
+func (s *Store) appendEventsLocked(cID string, events []domain.Event) (int64, error) {
+	f, err := os.OpenFile(s.path, os.O_APPEND|os.O_WRONLY, 0644)
+	if err != nil {
+		return 0, err
+	}
+	defer f.Close()
+	info, err := f.Stat()
+	if err != nil {
+		return 0, err
+	}
+	offset := info.Size()
+	var records bytes.Buffer
+	for _, event := range events {
+		b, _ := json.Marshal(Record{CaseID: cID, Event: event})
+		records.Write(b)
+		records.WriteByte('\n')
+	}
+	if _, err = f.Write(records.Bytes()); err != nil {
+		return 0, err
+	}
+	if err = f.Sync(); err != nil {
+		return 0, err
+	}
+	return offset, nil
+}
+
+// rollbackEventsLocked 将事件日志截断回给定的偏移量，
+// 以在快照写入失败时移除部分追加的事件记录。
+func (s *Store) rollbackEventsLocked(offset int64) {
+	_ = os.Truncate(s.path, offset)
+}
+
+// commitSnapshotsLocked 将 cases、requestHashes 和 requestResults 快照写入磁盘。
+// 如果任何写入失败，则返回错误，调用者必须回滚事件日志并中止事务。
+func (s *Store) writeSnapshotsLocked(cases map[string]*domain.Case, requestHashes map[string]string, requestResults map[string]CachedRequestResult) error {
+	dir := filepath.Dir(s.path)
+	sb, err := json.Marshal(cases)
+	if err != nil {
+		return err
+	}
+	if err = os.WriteFile(filepath.Join(dir, "cases.json"), sb, 0644); err != nil {
+		return err
+	}
+	hb, err := json.Marshal(requestHashes)
+	if err != nil {
+		return err
+	}
+	if err = os.WriteFile(filepath.Join(dir, "requests.json"), hb, 0644); err != nil {
+		return err
+	}
+	all, err := json.Marshal(requestResults)
+	if err != nil {
+		return err
+	}
+	if err = os.WriteFile(filepath.Join(dir, "request_results.json"), all, 0644); err != nil {
+		return err
+	}
+	return nil
+}
+
 func (s *Store) PutEvents(c *domain.Case, events []domain.Event, rid string, result any, requestHash string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -159,43 +222,41 @@ func (s *Store) PutEvents(c *domain.Case, events []domain.Event, rid string, res
 	if oldHash, ok := s.requestHashes[rid]; ok && requestHash != "" && oldHash != requestHash {
 		return errors.New("request_id 重复载荷冲突")
 	}
-	f, err := os.OpenFile(s.path, os.O_APPEND|os.O_WRONLY, 0644)
+	offset, err := s.appendEventsLocked(c.ID, events)
 	if err != nil {
 		return err
 	}
-	defer f.Close()
-	var records bytes.Buffer
-	for _, event := range events {
-		b, _ := json.Marshal(Record{CaseID: c.ID, Event: event})
-		records.Write(b)
-		records.WriteByte('\n')
+	// 在提交之前准备好快照数据，以便失败时可以回滚。
+	newCases := make(map[string]*domain.Case, len(s.cases))
+	for k, v := range s.cases {
+		newCases[k] = v
 	}
-	if _, err = f.Write(records.Bytes()); err != nil {
-		return err
+	newCases[c.ID] = domain.CloneCase(c)
+	newRequestHashes := make(map[string]string, len(s.requestHashes))
+	for k, v := range s.requestHashes {
+		newRequestHashes[k] = v
 	}
-	if err = f.Sync(); err != nil {
-		return err
-	}
-	s.cases[c.ID] = domain.CloneCase(c)
-	s.events[c.ID] = append(s.events[c.ID], events...)
-	sb, _ := json.Marshal(s.cases)
-	if err = os.WriteFile(filepath.Join(filepath.Dir(s.path), "cases.json"), sb, 0644); err != nil {
-		return err
-	}
-	s.requests[rid] = result
-	if requestHash == "" && len(events) > 0 {
+	rh := requestHash
+	if rh == "" && len(events) > 0 {
 		b, _ := json.Marshal(events[0].Data)
-		requestHash = string(b)
+		rh = string(b)
 	}
-	s.requestHashes[rid] = requestHash
-	if hb, e := json.Marshal(s.requestHashes); e == nil {
-		if err = os.WriteFile(filepath.Join(filepath.Dir(s.path), "requests.json"), hb, 0644); err != nil {
-			return err
-		}
+	newRequestHashes[rid] = rh
+	newRequestResults, rerr := s.buildRequestResultLocked(rid, result)
+	if rerr != nil {
+		s.rollbackEventsLocked(offset)
+		return rerr
 	}
-	if err = s.saveRequestResultLocked(rid, result); err != nil {
+	if err = s.writeSnapshotsLocked(newCases, newRequestHashes, newRequestResults); err != nil {
+		s.rollbackEventsLocked(offset)
 		return err
 	}
+	// 仅在所有快照持久化成功后才提交内存状态。
+	s.cases = newCases
+	s.events[c.ID] = append(s.events[c.ID], events...)
+	s.requests[rid] = result
+	s.requestHashes = newRequestHashes
+	s.requestResults = newRequestResults
 	return nil
 }
 func (s *Store) Create(c *domain.Case, rid string) error {
@@ -204,33 +265,44 @@ func (s *Store) Create(c *domain.Case, rid string) error {
 	if _, ok := s.cases[c.ID]; ok {
 		return errors.New("case_id 已存在")
 	}
-	f, err := os.OpenFile(s.path, os.O_APPEND|os.O_WRONLY, 0644)
+	ev := c.Events[len(c.Events)-1]
+	offset, err := s.appendEventsLocked(c.ID, []domain.Event{ev})
 	if err != nil {
 		return err
 	}
-	defer f.Close()
-	ev := c.Events[len(c.Events)-1]
-	b, _ := json.Marshal(Record{CaseID: c.ID, Event: ev})
-	f.Write(append(b, '\n'))
-	f.Sync()
-	s.cases[c.ID] = domain.CloneCase(c)
-	s.events[c.ID] = append(s.events[c.ID], ev)
-	sb, _ := json.Marshal(s.cases)
-	os.WriteFile(filepath.Join(filepath.Dir(s.path), "cases.json"), sb, 0644)
-	s.requests[rid] = c
-	if b, e := json.Marshal(ev.Data); e == nil {
-		s.requestHashes[rid] = string(b)
-		if hb, e2 := json.Marshal(s.requestHashes); e2 == nil {
-			_ = os.WriteFile(filepath.Join(filepath.Dir(s.path), "requests.json"), hb, 0644)
-		}
+	// 在提交之前准备快照数据，以便失败时可以回滚。
+	newCases := make(map[string]*domain.Case, len(s.cases)+1)
+	for k, v := range s.cases {
+		newCases[k] = v
 	}
-	if err := s.saveRequestResultLocked(rid, c); err != nil {
+	newCases[c.ID] = domain.CloneCase(c)
+	newRequestHashes := make(map[string]string, len(s.requestHashes)+1)
+	for k, v := range s.requestHashes {
+		newRequestHashes[k] = v
+	}
+	if b, e := json.Marshal(ev.Data); e == nil {
+		newRequestHashes[rid] = string(b)
+	}
+	newRequestResults, rerr := s.buildRequestResultLocked(rid, c)
+	if rerr != nil {
+		s.rollbackEventsLocked(offset)
+		return rerr
+	}
+	if err = s.writeSnapshotsLocked(newCases, newRequestHashes, newRequestResults); err != nil {
+		s.rollbackEventsLocked(offset)
 		return err
 	}
+	// 仅在所有快照持久化成功后才提交内存状态。
+	s.cases = newCases
+	s.events[c.ID] = append(s.events[c.ID], ev)
+	s.requests[rid] = c
+	s.requestHashes = newRequestHashes
+	s.requestResults = newRequestResults
 	return nil
 }
 
-func (s *Store) saveRequestResultLocked(rid string, result any) error {
+// buildRequestResultLocked 构造缓存的请求结果条目，而不修改 s.requestResults。
+func (s *Store) buildRequestResultLocked(rid string, result any) (map[string]CachedRequestResult, error) {
 	kind := ""
 	switch result.(type) {
 	case *domain.Case, domain.Case:
@@ -238,18 +310,34 @@ func (s *Store) saveRequestResultLocked(rid string, result any) error {
 	case audit.Manifest, *audit.Manifest:
 		kind = "manifest"
 	default:
-		return errors.New("不支持的幂等结果类型")
+		return nil, errors.New("不支持的幂等结果类型")
 	}
 	raw, err := json.Marshal(result)
 	if err != nil {
-		return err
+		return nil, err
 	}
-	s.requestResults[rid] = CachedRequestResult{Kind: kind, Result: raw}
-	all, err := json.Marshal(s.requestResults)
+	out := make(map[string]CachedRequestResult, len(s.requestResults)+1)
+	for k, v := range s.requestResults {
+		out[k] = v
+	}
+	out[rid] = CachedRequestResult{Kind: kind, Result: raw}
+	return out, nil
+}
+
+func (s *Store) saveRequestResultLocked(rid string, result any) error {
+	newResults, err := s.buildRequestResultLocked(rid, result)
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(filepath.Join(filepath.Dir(s.path), "request_results.json"), all, 0644)
+	all, err := json.Marshal(newResults)
+	if err != nil {
+		return err
+	}
+	if err = os.WriteFile(filepath.Join(filepath.Dir(s.path), "request_results.json"), all, 0644); err != nil {
+		return err
+	}
+	s.requestResults = newResults
+	return nil
 }
 func (s *Store) Request(rid string) (any, bool) {
 	s.mu.Lock()
