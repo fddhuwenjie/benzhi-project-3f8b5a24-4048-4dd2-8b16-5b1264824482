@@ -269,35 +269,42 @@ func (s *Service) Seal(id, rid string, rev int, by string) (audit.Manifest, erro
 		return audit.Manifest{}, err
 	}
 	m := audit.Build(c, by)
-	s.manifests[id] = m
-	if err := s.st.SaveManifest(id, m); err != nil {
-		return audit.Manifest{}, err
-	}
 	newEvents := make([]domain.Event, 0, 1)
 	for _, e := range c.Events {
 		if e.Revision > rev {
 			newEvents = append(newEvents, e)
 		}
 	}
-	if err := s.st.PutEvents(c, newEvents, rid, m, hash); err != nil {
+	// 先持久化清单再提交封存事件；任一失败都不得暴露本次产生的清单，
+	// 个案状态由 PutEvents 决定——它未成功提交时个案保持 RELEASED。
+	if err := s.st.SaveManifest(id, m); err != nil {
 		return audit.Manifest{}, err
 	}
+	if err := s.st.PutEvents(c, newEvents, rid, m, hash); err != nil {
+		s.st.RemoveManifest(id)
+		return audit.Manifest{}, err
+	}
+	s.manifests[id] = m
 	return m, nil
 }
 func (s *Service) Get(id string) *domain.Case { return s.st.Get(id) }
 func (s *Service) Manifest(id string) (audit.Manifest, bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	// 封存凭据仅在清单与封存事件均已成功提交后提供：个案未进入 SEALED
+	// 之前不返回任何清单，即使磁盘上存在残留副本也不暴露。
+	c := s.st.Get(id)
+	if c == nil || c.Status != domain.Sealed {
+		return audit.Manifest{}, false
+	}
 	m, ok := s.st.Manifest(id)
 	if ok {
 		s.manifests[id] = m
 	}
 	if !ok {
-		if c := s.st.Get(id); c != nil && c.Status == domain.Sealed {
-			m = audit.Build(c, "")
-			s.manifests[id] = m
-			ok = true
-		}
+		m = audit.Build(c, "")
+		s.manifests[id] = m
+		ok = true
 	}
 	return m, ok
 }

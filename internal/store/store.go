@@ -120,12 +120,39 @@ func (s *Store) RequestHash(rid string) (string, bool) {
 func (s *Store) SaveManifest(id string, m audit.Manifest) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.manifests[id] = m
-	b, e := json.Marshal(s.manifests)
+	updated := make(map[string]audit.Manifest, len(s.manifests)+1)
+	for k, v := range s.manifests {
+		updated[k] = v
+	}
+	updated[id] = m
+	b, e := json.Marshal(updated)
 	if e != nil {
 		return e
 	}
-	return os.WriteFile(filepath.Join(filepath.Dir(s.path), "manifests.json"), b, 0644)
+	if err := os.WriteFile(filepath.Join(filepath.Dir(s.path), "manifests.json"), b, 0644); err != nil {
+		return err
+	}
+	// 仅在持久化成功后才更新内存缓存，避免写入失败时暴露未提交的清单。
+	s.manifests = updated
+	return nil
+}
+func (s *Store) RemoveManifest(id string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if _, ok := s.manifests[id]; !ok {
+		return
+	}
+	updated := make(map[string]audit.Manifest, len(s.manifests)-1)
+	for k, v := range s.manifests {
+		if k == id {
+			continue
+		}
+		updated[k] = v
+	}
+	if b, e := json.Marshal(updated); e == nil {
+		_ = os.WriteFile(filepath.Join(filepath.Dir(s.path), "manifests.json"), b, 0644)
+	}
+	s.manifests = updated
 }
 func (s *Store) Manifest(id string) (audit.Manifest, bool) {
 	s.mu.Lock()
