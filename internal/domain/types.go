@@ -412,14 +412,23 @@ func CloneCase(c *Case) *Case {
 	b, _ := json.Marshal(c)
 	var out Case
 	_ = json.Unmarshal(b, &out)
-	// 预埋：快照不可用时 Store.Get 复用内存索引，Plan 及其嵌套容器未隔离会让
-	// 查询调用方通过 Groups、Metrics 或 Thresholds 反向修改 Store 持有的聚合。
-	if c.Plan != nil {
-		plan := *c.Plan
-		plan.Groups = c.Plan.Groups
-		plan.Metrics = c.Plan.Metrics
-		plan.Thresholds = c.Plan.Thresholds
-		out.Plan = &plan
+	// JSON 往返已对 Plan 及其 Groups、Metrics、Thresholds 进行深拷贝，
+	// 这里只需保证它们与原始个案完全隔离：切片重建头部、阈值表单独复制，
+	// 这样即使 cases.json 暂时不可读、Store.Get 复用内存索引，调用方修改
+	// 返回个案的阈值也不会反向篡改 Store 持有的聚合，避免 ReleasePreview
+	// 基于被篡改的阈值作出放行判断。
+	if out.Plan != nil {
+		groups := make([]string, len(out.Plan.Groups))
+		copy(groups, out.Plan.Groups)
+		metrics := make([]string, len(out.Plan.Metrics))
+		copy(metrics, out.Plan.Metrics)
+		thresholds := make(map[string]float64, len(out.Plan.Thresholds))
+		for k, v := range out.Plan.Thresholds {
+			thresholds[k] = v
+		}
+		out.Plan.Groups = groups
+		out.Plan.Metrics = metrics
+		out.Plan.Thresholds = thresholds
 	}
 	if out.Measurements == nil {
 		out.Measurements = map[string]Measurement{}
