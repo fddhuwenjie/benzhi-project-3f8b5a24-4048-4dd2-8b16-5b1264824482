@@ -146,6 +146,64 @@ func (s *Store) Get(id string) *domain.Case {
 	s.refreshCasesLocked()
 	return domain.CloneCase(s.cases[id])
 }
+// dirPath returns the store's data directory.
+func (s *Store) dirPath() string { return filepath.Dir(s.path) }
+
+// appendEventsLocked appends the given records to the event log and returns
+// the file offset before the append (for rollback). The caller holds s.mu.
+func (s *Store) appendEventsLocked(records []byte) (int64, error) {
+	info, err := os.Stat(s.path)
+	if err != nil {
+		return 0, err
+	}
+	offset := info.Size()
+	f, err := os.OpenFile(s.path, os.O_APPEND|os.O_WRONLY, 0644)
+	if err != nil {
+		return 0, err
+	}
+	defer f.Close()
+	if _, err := f.Write(records); err != nil {
+		return 0, err
+	}
+	if err := f.Sync(); err != nil {
+		return 0, err
+	}
+	return offset, nil
+}
+
+// truncateEventsLocked truncates the event log to the given offset, undoing a
+// partial append. Errors are best-effort because this runs on a rollback path.
+func (s *Store) truncateEventsLocked(offset int64) {
+	_ = os.Truncate(s.path, offset)
+	f, err := os.OpenFile(s.path, os.O_WRONLY, 0644)
+	if err != nil {
+		return
+	}
+	_ = f.Sync()
+	f.Close()
+}
+
+// writeSnapshotLocked writes a JSON snapshot file.
+func (s *Store) writeSnapshotLocked(name string, data []byte) error {
+	return os.WriteFile(filepath.Join(s.dirPath(), name), data, 0644)
+}
+
+// snapshotBytes reads the current on-disk bytes of a snapshot file so a
+// rollback can restore the exact pre-command content.
+func (s *Store) snapshotBytes(name string) []byte {
+	b, _ := os.ReadFile(filepath.Join(s.dirPath(), name))
+	return b
+}
+
+// restoreSnapshotLocked writes the captured bytes back to the snapshot file.
+func (s *Store) restoreSnapshotLocked(name string, data []byte) {
+	if data == nil {
+		_ = os.Remove(filepath.Join(s.dirPath(), name))
+		return
+	}
+	_ = os.WriteFile(filepath.Join(s.dirPath(), name), data, 0644)
+}
+
 func (s *Store) PutCase(c *domain.Case, ev domain.Event, rid string, result any) error {
 	return s.PutEvents(c, []domain.Event{ev}, rid, result, "")
 }
@@ -159,72 +217,169 @@ func (s *Store) PutEvents(c *domain.Case, events []domain.Event, rid string, res
 	if oldHash, ok := s.requestHashes[rid]; ok && requestHash != "" && oldHash != requestHash {
 		return errors.New("request_id 重复载荷冲突")
 	}
-	f, err := os.OpenFile(s.path, os.O_APPEND|os.O_WRONLY, 0644)
-	if err != nil {
-		return err
-	}
-	defer f.Close()
+
+	// Capture the pre-command on-disk snapshot bytes so any failure can
+	// restore them exactly, and the pre-command in-memory state.
+	prevCasesBytes := s.snapshotBytes("cases.json")
+	prevRequestsBytes := s.snapshotBytes("requests.json")
+	prevRRBytes := s.snapshotBytes("request_results.json")
+	prevCase, prevCaseExists := s.cases[c.ID]
+	prevEvents := append([]domain.Event(nil), s.events[c.ID]...)
+	prevResult, prevResultExists := s.requests[rid]
+	prevHash, prevHashExists := s.requestHashes[rid]
+	prevRR, prevRRExists := s.requestResults[rid]
+
+	// Build the event-log records and append them (intent to commit).
 	var records bytes.Buffer
 	for _, event := range events {
 		b, _ := json.Marshal(Record{CaseID: c.ID, Event: event})
 		records.Write(b)
 		records.WriteByte('\n')
 	}
-	if _, err = f.Write(records.Bytes()); err != nil {
+	offset, err := s.appendEventsLocked(records.Bytes())
+	if err != nil {
 		return err
 	}
-	if err = f.Sync(); err != nil {
-		return err
-	}
+
+	// Mutate in-memory state to the post-command view.
 	s.cases[c.ID] = domain.CloneCase(c)
 	s.events[c.ID] = append(s.events[c.ID], events...)
-	sb, _ := json.Marshal(s.cases)
-	if err = os.WriteFile(filepath.Join(filepath.Dir(s.path), "cases.json"), sb, 0644); err != nil {
-		return err
-	}
 	s.requests[rid] = result
 	if requestHash == "" && len(events) > 0 {
 		b, _ := json.Marshal(events[0].Data)
 		requestHash = string(b)
 	}
 	s.requestHashes[rid] = requestHash
+
+	// Persist the derived snapshots. If any step fails, roll back the event
+	// log, the on-disk snapshots, and all in-memory state so the caller,
+	// readers, and restarts all observe the pre-command state.
+	restoreMemory := func() {
+		if prevCaseExists {
+			s.cases[c.ID] = prevCase
+		} else {
+			delete(s.cases, c.ID)
+		}
+		s.events[c.ID] = prevEvents
+		if len(s.events[c.ID]) == 0 {
+			delete(s.events, c.ID)
+		}
+		if prevResultExists {
+			s.requests[rid] = prevResult
+		} else {
+			delete(s.requests, rid)
+		}
+		if prevHashExists {
+			s.requestHashes[rid] = prevHash
+		} else {
+			delete(s.requestHashes, rid)
+		}
+		if prevRRExists {
+			s.requestResults[rid] = prevRR
+		} else {
+			delete(s.requestResults, rid)
+		}
+	}
+	rollback := func() {
+		s.restoreSnapshotLocked("cases.json", prevCasesBytes)
+		s.restoreSnapshotLocked("requests.json", prevRequestsBytes)
+		s.restoreSnapshotLocked("request_results.json", prevRRBytes)
+		restoreMemory()
+		s.truncateEventsLocked(offset)
+	}
+
+	if sb, e := json.Marshal(s.cases); e == nil {
+		if err = s.writeSnapshotLocked("cases.json", sb); err != nil {
+			rollback()
+			return err
+		}
+	}
 	if hb, e := json.Marshal(s.requestHashes); e == nil {
-		if err = os.WriteFile(filepath.Join(filepath.Dir(s.path), "requests.json"), hb, 0644); err != nil {
+		if err = s.writeSnapshotLocked("requests.json", hb); err != nil {
+			rollback()
 			return err
 		}
 	}
 	if err = s.saveRequestResultLocked(rid, result); err != nil {
+		rollback()
 		return err
 	}
 	return nil
 }
+
 func (s *Store) Create(c *domain.Case, rid string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if _, ok := s.cases[c.ID]; ok {
 		return errors.New("case_id 已存在")
 	}
-	f, err := os.OpenFile(s.path, os.O_APPEND|os.O_WRONLY, 0644)
+
+	// Capture pre-command on-disk snapshot bytes and in-memory state.
+	prevCasesBytes := s.snapshotBytes("cases.json")
+	prevRequestsBytes := s.snapshotBytes("requests.json")
+	prevRRBytes := s.snapshotBytes("request_results.json")
+	prevResult, prevResultExists := s.requests[rid]
+	prevHash, prevHashExists := s.requestHashes[rid]
+	prevRR, prevRRExists := s.requestResults[rid]
+
+	ev := c.Events[len(c.Events)-1]
+	rec, _ := json.Marshal(Record{CaseID: c.ID, Event: ev})
+	offset, err := s.appendEventsLocked(append(rec, '\n'))
 	if err != nil {
 		return err
 	}
-	defer f.Close()
-	ev := c.Events[len(c.Events)-1]
-	b, _ := json.Marshal(Record{CaseID: c.ID, Event: ev})
-	f.Write(append(b, '\n'))
-	f.Sync()
+
+	// Mutate in-memory state to the post-command view.
 	s.cases[c.ID] = domain.CloneCase(c)
 	s.events[c.ID] = append(s.events[c.ID], ev)
-	sb, _ := json.Marshal(s.cases)
-	os.WriteFile(filepath.Join(filepath.Dir(s.path), "cases.json"), sb, 0644)
 	s.requests[rid] = c
+	requestHash := ""
 	if b, e := json.Marshal(ev.Data); e == nil {
-		s.requestHashes[rid] = string(b)
-		if hb, e2 := json.Marshal(s.requestHashes); e2 == nil {
-			_ = os.WriteFile(filepath.Join(filepath.Dir(s.path), "requests.json"), hb, 0644)
+		requestHash = string(b)
+	}
+	s.requestHashes[rid] = requestHash
+
+	restoreMemory := func() {
+		delete(s.cases, c.ID)
+		delete(s.events, c.ID)
+		if prevResultExists {
+			s.requests[rid] = prevResult
+		} else {
+			delete(s.requests, rid)
+		}
+		if prevHashExists {
+			s.requestHashes[rid] = prevHash
+		} else {
+			delete(s.requestHashes, rid)
+		}
+		if prevRRExists {
+			s.requestResults[rid] = prevRR
+		} else {
+			delete(s.requestResults, rid)
 		}
 	}
-	if err := s.saveRequestResultLocked(rid, c); err != nil {
+	rollback := func() {
+		s.restoreSnapshotLocked("cases.json", prevCasesBytes)
+		s.restoreSnapshotLocked("requests.json", prevRequestsBytes)
+		s.restoreSnapshotLocked("request_results.json", prevRRBytes)
+		restoreMemory()
+		s.truncateEventsLocked(offset)
+	}
+
+	if sb, e := json.Marshal(s.cases); e == nil {
+		if err = s.writeSnapshotLocked("cases.json", sb); err != nil {
+			rollback()
+			return err
+		}
+	}
+	if hb, e := json.Marshal(s.requestHashes); e == nil {
+		if err = s.writeSnapshotLocked("requests.json", hb); err != nil {
+			rollback()
+			return err
+		}
+	}
+	if err = s.saveRequestResultLocked(rid, c); err != nil {
+		rollback()
 		return err
 	}
 	return nil
